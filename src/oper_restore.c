@@ -107,6 +107,15 @@ int is_filedir_excluded(char *relpath)
     return false; // no exclusion found for that file
 }
 
+// returns true if this file of a parent directory has been excluded
+int is_file_included(char *relpath)
+{
+    if (strlist_count(&g_options.include)==0)
+        return true;
+
+    return include_check(&g_options.include, relpath);
+}
+
 // convert an array of strings "id=x,dest=/dev/xxx,..." to an array of strdico
 int convert_argv_to_strdicos(cstrdico *dicoargv[], int argc, char *cmdargv[])
 {
@@ -154,6 +163,56 @@ int convert_argv_to_strdicos(cstrdico *dicoargv[], int argc, char *cmdargv[])
             return -1;
         }
         
+        // add the current argument to the list of the strdico objects
+        if (dicoargv[fsid]!=NULL)
+        {   errprintf("you mentioned filesystem with id=%d multiple times, cannot continue\n", fsid);
+            strdico_destroy(tmpdico);
+            return -1;
+        }
+        dicoargv[fsid]=tmpdico;
+    }
+    
+    return 0;
+}
+
+// convert an array of strings "id=x,dest=/dev/xxx,..." to an array of strdico
+int convert_argv_to_strdicos_for_extract(cstrdico *dicoargv[], int argc, char *cmdargv[])
+{
+    cstrdico *tmpdico=NULL;
+    s64 temp64;
+    int fsid;
+    int i;
+    
+    if (argc == 0)
+    {   errprintf("No filesystem id specified (at least one 'id=X' argument must be specified).\n");
+        return -1;
+    }
+
+    for (i=0; (i<argc) && (i < FSA_MAX_FSPERARCH) && (cmdargv[i]!=NULL); i++)
+    {
+        if ((tmpdico=strdico_alloc())==NULL)
+            return -1;
+        
+        // parse argument and write (key,value) pairs in the strdico object
+        if ((strdico_set_valid_keys(tmpdico, "id,dest")!=0) ||
+            (strdico_parse_string(tmpdico, cmdargv[i])!=0))
+        {   strdico_destroy(tmpdico);
+            return -1;
+        }
+        
+        // read and check "id=" key in the argument
+        if (strdico_get_s64(tmpdico, &temp64, "id")!=0)
+        {   errprintf("cannot find \"id=\" key in \"%s\"\n", cmdargv[i]);
+            strdico_destroy(tmpdico);
+            return -1;
+        }
+        fsid=temp64;
+        if ((fsid<0) || (fsid>FSA_MAX_FSPERARCH-1))
+        {   errprintf("invalid filesystem id [%d]: it must match a valid filesystem id as shown by archinfo\n", fsid);
+            strdico_destroy(tmpdico);
+            return -1;
+        }
+       
         // add the current argument to the list of the strdico objects
         if (dicoargv[fsid]!=NULL)
         {   errprintf("you mentioned filesystem with id=%d multiple times, cannot continue\n", fsid);
@@ -336,7 +395,7 @@ int extractar_restore_attr_everything(cextractar *exar, int objtype, char *fullp
     return (res==0)?(0):(-1);
 }
 
-int extractar_restore_obj_symlink(cextractar *exar, char *fullpath, char *relpath, char *destdir, cdico *d, int objtype, int fstype)
+int extractar_restore_obj_symlink(cextractar *exar, char *fullpath, char *relpath, char *destdir, cdico *d, int objtype, int fstype, int oper)
 {
     char parentdir[PATH_MAX];
     struct timeval tv[2];
@@ -346,11 +405,20 @@ int extractar_restore_obj_symlink(cextractar *exar, char *fullpath, char *relpat
     
     // update cost statistics and progress bar
     exar->cost_current+=FSA_COST_PER_FILE; 
-    
+
     // check the list of excluded files/dirs
     if (is_filedir_excluded(relpath)==true)
         goto extractar_restore_obj_symlink_err;
     
+    if (is_file_included(relpath)!=true)
+        goto extractar_restore_obj_symlink_err;
+
+    if (oper == OPER_EXTRACT)
+    {
+        printf("%s %s\n", get_objtype_name(objtype), relpath);
+        goto extractar_restore_obj_symlink_ok;
+    }
+
     // update progress bar
     extractar_listing_print_file(exar, objtype, relpath);
 
@@ -414,6 +482,7 @@ int extractar_restore_obj_symlink(cextractar *exar, char *fullpath, char *relpat
         goto extractar_restore_obj_symlink_err;
     }
     
+extractar_restore_obj_symlink_ok:
     dico_destroy(d);
     exar->stats.cnt_symlink++;
     return 0; // success
@@ -424,7 +493,7 @@ extractar_restore_obj_symlink_err:
     return 0; // non fatal error
 }
 
-int extractar_restore_obj_hardlink(cextractar *exar, char *fullpath, char *relpath, char *destdir, cdico *d, int objtype, int fstype)
+int extractar_restore_obj_hardlink(cextractar *exar, char *fullpath, char *relpath, char *destdir, cdico *d, int objtype, int fstype, int oper)
 {
     char parentdir[PATH_MAX];
     struct timeval tv[2];
@@ -438,7 +507,16 @@ int extractar_restore_obj_hardlink(cextractar *exar, char *fullpath, char *relpa
     // check the list of excluded files/dirs
     if (is_filedir_excluded(relpath)==true)
         goto extractar_restore_obj_hardlink_err;
-    
+
+    if (is_file_included(relpath)!=true)
+        goto extractar_restore_obj_hardlink_err;
+
+    if (oper == OPER_EXTRACT)
+    {
+        printf("%s %s\n", get_objtype_name(objtype), relpath);
+        goto extractar_restore_obj_hardlink_ok;
+    }
+
     // create parent directory first
     extract_dirpath(fullpath, parentdir, sizeof(parentdir));
     mkdir_recursive(parentdir);
@@ -472,6 +550,7 @@ int extractar_restore_obj_hardlink(cextractar *exar, char *fullpath, char *relpa
         goto extractar_restore_obj_hardlink_err;
     }
     
+extractar_restore_obj_hardlink_ok:
     dico_destroy(d);
     exar->stats.cnt_hardlink++;
     return 0; // success
@@ -482,7 +561,7 @@ extractar_restore_obj_hardlink_err:
     return 0; // non fatal error
 }
 
-int extractar_restore_obj_devfile(cextractar *exar, char *fullpath, char *relpath, char *destdir, cdico *d, int objtype, int fstype)
+int extractar_restore_obj_devfile(cextractar *exar, char *fullpath, char *relpath, char *destdir, cdico *d, int objtype, int fstype, int oper)
 {
     char parentdir[PATH_MAX];
     struct timeval tv[2];
@@ -495,7 +574,16 @@ int extractar_restore_obj_devfile(cextractar *exar, char *fullpath, char *relpat
     // check the list of excluded files/dirs
     if (is_filedir_excluded(relpath)==true)
         goto extractar_restore_obj_devfile_err;
-    
+
+    if (is_file_included(relpath)!=true)
+        goto extractar_restore_obj_devfile_err;
+
+    if (oper == OPER_EXTRACT)
+    {
+        printf("%s %s\n", get_objtype_name(objtype), relpath);
+        goto extractar_restore_obj_devfile_ok;
+    }
+
     // create parent directory first
     extract_dirpath(fullpath, parentdir, sizeof(parentdir));
     mkdir_recursive(parentdir);
@@ -524,7 +612,8 @@ int extractar_restore_obj_devfile(cextractar *exar, char *fullpath, char *relpat
     {   sysprintf("utimes(%s) failed\n", parentdir);
         goto extractar_restore_obj_devfile_err;
     }
-    
+
+extractar_restore_obj_devfile_ok:    
     dico_destroy(d);
     exar->stats.cnt_special++;
     return 0; // success
@@ -547,6 +636,14 @@ int extractar_restore_obj_directory(cextractar *exar, char *fullpath, char *relp
     if (is_filedir_excluded(relpath)==true)
         goto extractar_restore_obj_directory_err;
     
+    if (is_file_included(relpath)!=true)
+        goto extractar_restore_obj_directory_err;
+    
+    if (destdir==NULL)
+    {   printf("%s %s\n", get_objtype_name(objtype), relpath);
+        goto extractar_restore_obj_directory_ok;
+    }
+
     // create parent directory first
     extract_dirpath(fullpath, parentdir, sizeof(parentdir));
     mkdir_recursive(parentdir);
@@ -570,6 +667,7 @@ int extractar_restore_obj_directory(cextractar *exar, char *fullpath, char *relp
         goto extractar_restore_obj_directory_err;
     }
     
+extractar_restore_obj_directory_ok:
     dico_destroy(d);
     exar->stats.cnt_dir++;
     return 0; // success
@@ -580,16 +678,18 @@ extractar_restore_obj_directory_err:
     return 0; // non fatal error
 }
 
-int extractar_restore_obj_regfile_multi(cextractar *exar, char *destdir, cdico *dicofirstfile, int objtype, int fstype) // d = obj-header of first small file
+int extractar_restore_obj_regfile_multi(cextractar *exar, char *destdir, cdico *dicofirstfile, int objtype, int fstype, int oper) // d = obj-header of first small file
 {
     cdatafile *datafile=NULL;
     char databuf[FSA_MAX_SMALLFILESIZE];
     char basename[PATH_MAX];
     cdico *filehead=NULL;
     char magic[FSA_SIZEOF_MAGIC+1];
-    char fullpath[PATH_MAX];
+    char destpath[PATH_MAX];
+    char *fullpath=NULL;
     char relpath[PATH_MAX];
     char parentdir[PATH_MAX];
+    char buffer[256];
     struct timeval tv[2];
     struct s_blockinfo blkinfo;
     cregmulti regmulti;
@@ -668,63 +768,79 @@ int extractar_restore_obj_regfile_multi(cextractar *exar, char *destdir, cdico *
             dico_show(filehead, DICO_OBJ_SECTION_STDATTR, "DISKITEMKEY_PATH");
             goto extractar_restore_obj_regfile_multi_err;
         }
-        concatenate_paths(fullpath, sizeof(fullpath), destdir, relpath);
-        extract_basename(fullpath, basename, sizeof(basename));
-        
+        fullpath = NULL;
+        if (destdir != NULL)
+        {   concatenate_paths(destpath, sizeof(destpath), destdir, relpath);
+            fullpath=destpath;
+        }
+        extract_basename(relpath, basename, sizeof(basename));
+
         // update cost statistics and progress bar
         exar->cost_current+=FSA_COST_PER_FILE; 
         exar->cost_current+=datsize; // filesize
         
         // check the list of excluded files/dirs
-        if (is_filedir_excluded(relpath)!=true)
-        {
-            // create parent directory if necessary
-            extract_dirpath(fullpath, parentdir, sizeof(parentdir));
-            mkdir_recursive(parentdir);
-            
-            // backup parent dir atime/mtime
-            get_parent_dir_time_attrib(fullpath, parentdir, sizeof(parentdir), tv);
-            
-            extractar_listing_print_file(exar, tmpobjtype, relpath);
-            
-            if (dico_get_data(filehead, DICO_OBJ_SECTION_STDATTR, DISKITEMKEY_MD5SUM, md5sumorig, 16, NULL))
-            {   errprintf("cannot get md5sum from file footer for file=[%s]\n", relpath);
-                dico_show(filehead, DICO_OBJ_SECTION_STDATTR, "filehead");
-                goto extractar_restore_obj_regfile_multi_err;
-            }
-            
-            if (datafile_open_write(datafile, fullpath, false, false)<0)
-                goto extractar_restore_obj_regfile_multi_err;
-            
-            res=datafile_write(datafile, databuf, datsize);
-            
-            datafile_close(datafile, md5sumcalc, sizeof(md5sumcalc));
-            
-            if (res!=FSAERR_SUCCESS)
-            {   errprintf("removing %s\n", fullpath);
-                unlink(fullpath);
-                return -1;
-            }
-            
-            if (memcmp(md5sumcalc, md5sumorig, 16)!=0)
-            {   errprintf("cannot restore file %s, the data block (which is shared by multiple files) is corrupt\n", relpath);
-                res=truncate(fullpath, 0); // don't leave corrupt data in the file
-                goto extractar_restore_obj_regfile_multi_err;
-            }
-                      
-            if (extractar_restore_attr_everything(exar, objtype, fullpath, relpath, filehead)!=0)
+        if (is_filedir_excluded(relpath)==true)
+            goto extractar_restore_obj_regfile_multi_exclude;
+
+        if (is_file_included(relpath)!=true)
+            goto extractar_restore_obj_regfile_multi_exclude;
+
+        if (fullpath == NULL)
+        {   printf("%s %s\t%s\n", get_objtype_name(objtype), relpath, format_size(datsize, buffer, sizeof(buffer), 'h'));
+            exar->stats.cnt_regfile++;
+            goto extractar_restore_obj_regfile_multi_exclude;
+        }
+
+        // create parent directory if necessary
+        extract_dirpath(fullpath, parentdir, sizeof(parentdir));
+        mkdir_recursive(parentdir);
+        
+        // backup parent dir atime/mtime
+        get_parent_dir_time_attrib(fullpath, parentdir, sizeof(parentdir), tv);
+        
+        extractar_listing_print_file(exar, tmpobjtype, relpath);
+        
+        if (dico_get_data(filehead, DICO_OBJ_SECTION_STDATTR, DISKITEMKEY_MD5SUM, md5sumorig, 16, NULL))
+        {   errprintf("cannot get md5sum from file footer for file=[%s]\n", relpath);
+            dico_show(filehead, DICO_OBJ_SECTION_STDATTR, "filehead");
+            goto extractar_restore_obj_regfile_multi_err;
+        }
+        
+        if (datafile_open_write(datafile, fullpath, false, false)<0)
+            goto extractar_restore_obj_regfile_multi_err;
+        
+        res=datafile_write(datafile, databuf, datsize);
+        
+        datafile_close(datafile, md5sumcalc, sizeof(md5sumcalc));
+        
+        if (res!=FSAERR_SUCCESS)
+        {   errprintf("removing %s\n", fullpath);
+            unlink(fullpath);
+            return -1;
+        }
+        
+        if (memcmp(md5sumcalc, md5sumorig, 16)!=0)
+        {   errprintf("cannot restore file %s, the data block (which is shared by multiple files) is corrupt\n", relpath);
+            res=truncate(fullpath, 0); // don't leave corrupt data in the file
+            goto extractar_restore_obj_regfile_multi_err;
+        }
+                    
+        if (oper!=OPER_EXTRACT)
+        {   if (extractar_restore_attr_everything(exar, objtype, fullpath, relpath, filehead)!=0)
             {   msgprintf(MSG_STACK, "cannot restore file attributes for file [%s]\n", relpath);
                 goto extractar_restore_obj_regfile_multi_err;
             }
-            
-            // restore parent dir mtime/atime
-            if (utimes(parentdir, tv)!=0)
-            {   sysprintf("utimes(%s) failed\n", parentdir);
-                goto extractar_restore_obj_regfile_multi_err;
-            }
-            exar->stats.cnt_regfile++;
         }
         
+        // restore parent dir mtime/atime
+        if (utimes(parentdir, tv)!=0)
+        {   sysprintf("utimes(%s) failed\n", parentdir);
+            goto extractar_restore_obj_regfile_multi_err;
+        }
+        exar->stats.cnt_regfile++;
+        
+extractar_restore_obj_regfile_multi_exclude:
         dico_destroy(filehead);
         continue; // success on that file
         
@@ -738,11 +854,12 @@ extractar_restore_obj_regfile_multi_err:
     return 0;
 }
 
-int extractar_restore_obj_regfile_unique(cextractar *exar, char *fullpath, char *relpath, char *destdir, cdico *d, int objtype, int fstype) // large or empty files
+int extractar_restore_obj_regfile_unique(cextractar *exar, char *fullpath, char *relpath, char *destdir, cdico *d, int objtype, int fstype, int oper) // large or empty files
 {
     char magic[FSA_SIZEOF_MAGIC+1];
     struct s_blockinfo blkinfo;
     char parentdir[PATH_MAX];
+    char buffer[256];
     cdatafile *datafile=NULL;
     cdico *footerdico=NULL;
     bool fatalerr=false; // error for restoration globally
@@ -775,11 +892,19 @@ int extractar_restore_obj_regfile_unique(cextractar *exar, char *fullpath, char 
     exar->cost_current+=filesize;
     
     // check the list of excluded files/dirs
-    if (is_filedir_excluded(relpath)==true)
+    if (is_filedir_excluded(relpath)==true ||
+        is_file_included(relpath)!=true)
     {
         excluded=true;
     }
-    else if (minorerr==false) // file not excluded and no error yet
+
+    if (destdir==NULL && excluded==false)
+    {
+        printf("%s %s\t%s\n", get_objtype_name(objtype), relpath, format_size(filesize, buffer, sizeof(buffer), 'h'));
+        exar->stats.cnt_regfile++;
+        excluded=true;
+    }
+    else if (minorerr==false && excluded==false) // file not excluded and no error yet
     {
         // create parent directory first
         extract_dirpath(fullpath, parentdir, sizeof(parentdir));
@@ -830,9 +955,13 @@ int extractar_restore_obj_regfile_unique(cextractar *exar, char *fullpath, char 
     
     if ((minorerr==false) && (excluded==false))
     {
-        if (extractar_restore_attr_everything(exar, objtype, fullpath, relpath, d)!=0)
-        {   msgprintf(MSG_STACK, "cannot restore file attributes for file [%s]\n", relpath);
-            minorerr=true;
+        // Don't restore attributes and ownership when extracting files.
+        if (oper!=OPER_EXTRACT)
+        {
+            if (extractar_restore_attr_everything(exar, objtype, fullpath, relpath, d)!=0)
+            {   msgprintf(MSG_STACK, "cannot restore file attributes for file [%s]\n", relpath);
+                minorerr=true;
+            }
         }
     
         // restore parent dir mtime/atime
@@ -851,7 +980,7 @@ int extractar_restore_obj_regfile_unique(cextractar *exar, char *fullpath, char 
             goto restore_obj_regfile_unique_end;
         }
         
-        if (excluded!=true)
+        if (excluded==false)
         {
             if (memcmp(magic, FSA_MAGIC_FILF, FSA_SIZEOF_MAGIC)!=0)
             {   errprintf("header is not what we expected: found=[%s] and expected=[%s]\n", magic, FSA_MAGIC_FILF);
@@ -897,10 +1026,11 @@ restore_obj_regfile_unique_end:
     return (fatalerr==false)?(0):(-1);
 }
 
-int extractar_restore_object(cextractar *exar, int *errors, char *destdir, cdico *dicoattr, int fstype)
+int extractar_restore_object(cextractar *exar, int *errors, char *destdir, cdico *dicoattr, int fstype, int oper)
 {
     char relpath[PATH_MAX];
-    char fullpath[PATH_MAX];
+    char destpath[PATH_MAX];
+    char *fullpath=NULL;
     u64 filesize;
     u32 objtype;
     int res;
@@ -914,7 +1044,11 @@ int extractar_restore_object(cextractar *exar, int *errors, char *destdir, cdico
         return -2;
     if (dico_get_u64(dicoattr, DICO_OBJ_SECTION_STDATTR, DISKITEMKEY_SIZE, &filesize)!=0)
         return -3;
-    concatenate_paths(fullpath, sizeof(fullpath), destdir, relpath);
+
+    if (destdir!= NULL)
+    {   concatenate_paths(destpath, sizeof(destpath), destdir, relpath);
+        fullpath=destpath;
+    }
     
     // ---- recreate specific object on the filesystem
     switch (objtype)
@@ -925,38 +1059,38 @@ int extractar_restore_object(cextractar *exar, int *errors, char *destdir, cdico
             break;
         case OBJTYPE_SYMLINK:
             msgprintf(MSG_DEBUG2, "objtype=OBJTYPE_SYMLINK, path=[%s]\n", relpath);
-            res=extractar_restore_obj_symlink(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype);
+            res= extractar_restore_obj_symlink(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype, oper);
             break;
         case OBJTYPE_HARDLINK:
             msgprintf(MSG_DEBUG2, "objtype=OBJTYPE_HARDLINK, path=[%s]\n", relpath);
-            res=extractar_restore_obj_hardlink(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype);
+            res= extractar_restore_obj_hardlink(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype, oper);
             break;
         case OBJTYPE_CHARDEV:
             msgprintf(MSG_DEBUG2, "objtype=OBJTYPE_CHARDEV, path=[%s]\n", relpath);
-            res=extractar_restore_obj_devfile(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype);
+            res= extractar_restore_obj_devfile(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype, oper);
             break;
         case OBJTYPE_BLOCKDEV:
             msgprintf(MSG_DEBUG2, "objtype=OBJTYPE_BLOCKDEV, path=[%s]\n", relpath);
-            res=extractar_restore_obj_devfile(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype);
+            res= extractar_restore_obj_devfile(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype, oper);
             break;
         case OBJTYPE_FIFO:
             msgprintf(MSG_DEBUG2, "objtype=OBJTYPE_FIFO, path=[%s]\n", relpath);
-            res=extractar_restore_obj_devfile(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype);
+            res= extractar_restore_obj_devfile(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype, oper);
             break;
         case OBJTYPE_SOCKET:
             msgprintf(MSG_DEBUG2, "objtype=OBJTYPE_SOCKET, path=[%s]\n", relpath);
-            res=extractar_restore_obj_devfile(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype);
+            res= extractar_restore_obj_devfile(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype, oper);
             break;
         case OBJTYPE_REGFILEUNIQUE:
             msgprintf(MSG_DEBUG2, "objtype=OBJTYPE_REGFILEUNIQUE, path=[%s]\n", relpath);
-            if ((res=extractar_restore_obj_regfile_unique(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype))<0)
+            if ((res=extractar_restore_obj_regfile_unique(exar, fullpath, relpath, destdir, dicoattr, objtype, fstype, oper))<0)
             {   msgprintf(MSG_STACK, "restore_obj_regfile_unique(%s) failed with res=%d\n", relpath, res);
                 return -1;
             }
             break;
         case OBJTYPE_REGFILEMULTI:
             msgprintf(MSG_DEBUG2, "objtype=OBJTYPE_REGFILEMULTI, path=[%s]\n", relpath);
-            if ((res=extractar_restore_obj_regfile_multi(exar, destdir, dicoattr, objtype, fstype))<0)
+            if ((res=extractar_restore_obj_regfile_multi(exar, destdir, dicoattr, objtype, fstype, oper))<0)
             {   msgprintf(MSG_STACK, "restore_obj_regfile_multi(%s) failed with res=%d\n", relpath, res);
                 return -1;
             }
@@ -973,7 +1107,7 @@ int extractar_restore_object(cextractar *exar, int *errors, char *destdir, cdico
     return 0;
 }
 
-int extractar_extract_read_objects(cextractar *exar, int *errors, char *destdir, int fstype)
+int extractar_extract_read_objects(cextractar *exar, int *errors, char *destdir, int fstype, int oper)
 {
     char magic[FSA_SIZEOF_MAGIC+1];
     cdico *dicoattr=NULL;
@@ -1021,7 +1155,7 @@ int extractar_extract_read_objects(cextractar *exar, int *errors, char *destdir,
             
             if (checkfsid==exar->fsid) // if filesystem-id is correct
             {
-                if ((res=extractar_restore_object(exar, &curerr, destdir, dicoattr, fstype))!=0)
+                if ((res=extractar_restore_object(exar, &curerr, destdir, dicoattr, fstype, oper))!=0)
                 {   msgprintf(MSG_STACK, "restore_object() failed with res=%d\n", res);
                     //dico_destroy(dicoattr);
                     return -1; // fatal error
@@ -1171,7 +1305,7 @@ int extractar_read_mainhead(cextractar *exar, cdico **dicomainhead)
     return 0;
 }
 
-int extractar_filesystem_extract(cextractar *exar, cdico *dicofs, cstrdico *dicocmdline)
+static int extractar_filesystem_extract_to_partition(cextractar *exar, cdico *dicofs, cstrdico *dicocmdline, int oper)
 {
     char filesystem[FSA_MAX_FSNAMELEN];
     char text[FSA_MAX_FSNAMELEN];
@@ -1310,7 +1444,7 @@ int extractar_filesystem_extract(cextractar *exar, cdico *dicofs, cstrdico *dico
         return -1;
     }
     
-    if (extractar_extract_read_objects(exar, &errors, mntbuf, fstype)!=0)
+    if (extractar_extract_read_objects(exar, &errors, mntbuf, fstype, oper)!=0)
     {   msgprintf(MSG_STACK, "extract_read_objects(%s) failed\n", mntbuf);
         ret=-1;
         goto filesystem_extract_umount;
@@ -1345,6 +1479,122 @@ filesystem_extract_umount:
     return ret;
 }
 
+static int extractar_filesystem_extract_to_filesystem(cextractar *exar, cdico *dicofs, cstrdico *dicocmdline, int oper)
+{
+    char magic[FSA_SIZEOF_MAGIC+1];
+    char target_dir[1024];
+    cdico *dicobegin=NULL;
+    cdico *dicoend=NULL;
+    int errors=0;
+    u64 minver;
+    u64 curver;
+    // For now just assume Ext2Fs...
+    // Shouldn't make a difference as long as no links or devices are extracted.
+    int fstype = 0;
+    int ret=0;
+    
+    // init
+    memset(magic, 0, sizeof(magic));
+    memset(target_dir, 0, sizeof(target_dir));
+    
+    // read destination partition from dicocmdline
+    strdico_get_string(dicocmdline, target_dir, sizeof(target_dir), "dest");
+    
+    // check that the minimum fsarchiver version required is ok
+    if (dico_get_u64(dicofs, 0, FSYSHEADKEY_MINFSAVERSION, &minver)!=0)
+        minver=FSA_VERSION_BUILD(0, 6, 4, 0); // fsarchiver-0.6.4 is the first fsa version having fileformat="FsArCh_002"
+    curver=FSA_VERSION_BUILD(PACKAGE_VERSION_A, PACKAGE_VERSION_B, PACKAGE_VERSION_C, PACKAGE_VERSION_D);
+    msgprintf(MSG_VERB2, "Current fsarchiver version: %d.%d.%d.%d\n", (int)FSA_VERSION_GET_A(curver), 
+        (int)FSA_VERSION_GET_B(curver), (int)FSA_VERSION_GET_C(curver), (int)FSA_VERSION_GET_D(curver));
+    msgprintf(MSG_VERB2, "Minimum fsarchiver version for that filesystem: %d.%d.%d.%d\n", (int)FSA_VERSION_GET_A(minver), 
+        (int)FSA_VERSION_GET_B(minver), (int)FSA_VERSION_GET_C(minver), (int)FSA_VERSION_GET_D(minver));
+    if (curver < minver)
+    {   errprintf("This filesystem can only be restored with fsarchiver %d.%d.%d.%d or more recent\n",
+        (int)FSA_VERSION_GET_A(minver), (int)FSA_VERSION_GET_B(minver), (int)FSA_VERSION_GET_C(minver),
+        (int)FSA_VERSION_GET_D(minver));
+        return -1;
+    }
+    
+    // ---- read filesystem-header from archive
+    if (queue_dequeue_header(&g_queue, &dicobegin, magic, NULL)<=0)
+    {   errprintf("queue_dequeue_header() failed: cannot read file system dico\n");
+        return -1;
+    }
+    dico_destroy(dicobegin);
+    
+    if (memcmp(magic, FSA_MAGIC_FSYB, FSA_SIZEOF_MAGIC)!=0)
+    {   errprintf("header is not what we expected: found=[%s] and expected=[%s]\n", magic, FSA_MAGIC_FSYB);
+        return -1;
+    }
+    
+    // ---- mount the new filesystem
+    
+    if (*target_dir)
+        mkdir_recursive(target_dir);
+    
+    if (extractar_extract_read_objects(exar, &errors, *target_dir ? target_dir : NULL, fstype, oper)!=0)
+    {   msgprintf(MSG_STACK, "extract_read_objects(%s) failed\n", target_dir);
+        ret=-1;
+        goto filesystem_extract_done;
+    }
+    else if (errors>0)
+    {   msgprintf(MSG_DEBUG1, "extract_read_objects(%s) worked with errors\n", target_dir);
+        ret=-1;
+        goto filesystem_extract_done;
+    }
+    
+    // read "end of file-system" header from archive
+    if (queue_dequeue_header(&g_queue, &dicoend, magic, NULL)<=0)
+    {   errprintf("queue_dequeue_header() failed\n");
+        ret=-1;
+        goto filesystem_extract_done;
+    }
+    dico_destroy(dicoend);
+    
+    if ((get_interrupted()==false) && (memcmp(magic, FSA_MAGIC_DATF, FSA_SIZEOF_MAGIC)!=0))
+    {   errprintf("header is not what we expected: found=[%s] and expected=[%s]\n", magic, FSA_MAGIC_DATF);
+        goto filesystem_extract_done;
+    }
+    
+filesystem_extract_done:
+    return ret;
+}
+
+int extractar_filesystem_extract(cextractar *exar, cdico *dicofs, cstrdico *dicocmdline, int oper)
+{
+    if (oper == OPER_RESTFS)
+        return extractar_filesystem_extract_to_partition(exar, dicofs, dicocmdline, oper);
+    
+    return extractar_filesystem_extract_to_filesystem(exar, dicofs, dicocmdline, oper);
+}
+
+
+static int check_dir(char *dirname)
+{
+    struct stat64 st;
+
+    if (stat64(dirname, &st)!=0)
+    {   
+        switch (errno)
+        {
+            case ENOENT:
+                sysprintf("%s does not exist, cannot continue\n", dirname);
+                break;
+            default:
+                sysprintf("fstat64(%s) failed\n", dirname);
+                break;
+        }
+        return false;
+    }
+    
+    if (!S_ISDIR(st.st_mode))
+    {   errprintf("%s is not a valid directory, cannot continue\n", dirname);
+        return false;
+    }
+
+    return true;
+}
+
 int oper_restore(char *archive, int argc, char **argv, int oper)
 {
     cdico *dicofsinfo[FSA_MAX_FSPERARCH];
@@ -1354,7 +1604,6 @@ int oper_restore(char *archive, int argc, char **argv, int oper)
     cdico *dicomainhead=NULL;
     cdico *dirsinfo=NULL;
     pthread_t thread_reader;
-    struct stat64 st;
     char *destdir;
     cextractar exar;
     u64 totalerr=0;
@@ -1398,7 +1647,18 @@ int oper_restore(char *archive, int argc, char **argv, int oper)
                 g_fsbitmap[i]=!!(dicoargv[i]!=NULL);
             break;
             
+	    case OPER_EXTRACT:
+            // convert the arguments from the command line to dico
+            if (convert_argv_to_strdicos_for_extract(dicoargv, argc, argv)!=0)
+            {   msgprintf(MSG_STACK, "convert_argv_to_dico() failed\n");
+                goto do_extract_error;
+            }
+            // say to the threadio_readarch thread which filesystems have to be read in archive
+            for (i=0; i<FSA_MAX_FSPERARCH; i++)
+                g_fsbitmap[i]=!!(dicoargv[i]!=NULL);
+            break;
         case OPER_RESTDIR: // the files are all considered as belonging to fsid==0
+
             g_fsbitmap[0]=1;
             break;
     }
@@ -1450,7 +1710,7 @@ int oper_restore(char *archive, int argc, char **argv, int oper)
     switch (exar.ai.archtype)
     {
         case ARCHTYPE_DIRECTORIES:
-            if (oper==OPER_RESTFS)
+            if (oper==OPER_RESTFS || oper==OPER_EXTRACT)
             {   errprintf("this archive does not contain filesystems, cannot use \"restfs\". Try \"restdir\" instead.\n");
                 goto do_extract_error;
             }
@@ -1519,7 +1779,7 @@ int oper_restore(char *archive, int argc, char **argv, int oper)
         }
     }
     
-    if ((oper==OPER_RESTFS) || (oper==OPER_RESTDIR))
+    if ((oper==OPER_RESTFS) || (oper==OPER_EXTRACT) || (oper==OPER_RESTDIR))
     {
         if ((exar.ai.cryptalgo!=ENCRYPT_NONE) && (g_options.encryptalgo!=ENCRYPT_BLOWFISH))
         {   errprintf("this archive has been encrypted, you have to provide a password on the command line using option '-c'\n");
@@ -1536,7 +1796,7 @@ int oper_restore(char *archive, int argc, char **argv, int oper)
                     exar.fsid=i;
                     memset(&exar.stats, 0, sizeof(exar.stats)); // init stats to zero
                     msgprintf(MSG_VERB1, "============= extracting filesystem %d =============\n", i);
-                    if (extractar_filesystem_extract(&exar, dicofsinfo[i], dicoargv[i])!=0)
+                    if (extractar_filesystem_extract(&exar, dicofsinfo[i], dicoargv[i], oper)!=0)
                     {   msgprintf(MSG_STACK, "extract_filesystem(%d) failed\n", i);
                         goto do_extract_error;
                     }
@@ -1551,27 +1811,11 @@ int oper_restore(char *archive, int argc, char **argv, int oper)
         {
             exar.fsid=0;
             destdir=argv[0];
-            if (stat64(destdir, &st)!=0)
-            {   
-                switch (errno)
-                {
-                    case ENOENT:
-                        sysprintf("%s does not exist, cannot continue\n", destdir);
-                        break;
-                    default:
-                        sysprintf("fstat64(%s) failed\n", destdir);
-                        break;
-                }
+            if (check_dir(destdir)!=true)
                 goto do_extract_error;
-            }
-            
-            if (!S_ISDIR(st.st_mode))
-            {   errprintf("%s is not a valid directory, cannot continue\n", destdir);
-                goto do_extract_error;
-            }
             
             memset(&exar.stats, 0, sizeof(exar.stats)); // init stats to zero
-            if (extractar_extract_read_objects(&exar, &errors, destdir, 0)!=0) // TODO: get the right fstype
+            if (extractar_extract_read_objects(&exar, &errors, destdir, 0, oper)!=0) // TODO: get the right fstype
             {   errprintf("extract_read_objects(%s) failed\n", destdir);
                 goto do_extract_error;
             }
